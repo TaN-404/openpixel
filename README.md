@@ -32,6 +32,22 @@ and assigned channels can be selected by typing their number.
   channel changes.
 - Dark responsive interface with one-, two-, and three-column guide layouts.
 
+## Screenshots
+
+<p align="center">
+  <img src="images/1.png" alt="OpenPixel TV screenshot 1" width="900">
+</p>
+
+<p align="center">
+  <img src="images/2.png" alt="OpenPixel TV screenshot 2" width="49%">
+  <img src="images/3.png" alt="OpenPixel TV screenshot 3" width="49%">
+</p>
+
+<p align="center">
+  <img src="images/4.png" alt="OpenPixel TV screenshot 4" width="49%">
+  <img src="images/5.png" alt="OpenPixel TV screenshot 5" width="49%">
+</p>
+
 ## Keyboard controls
 
 ### Player view
@@ -297,4 +313,3 @@ the responsibility of each stream provider and user.
 - [Reflex](https://reflex.dev/) for the Python web framework.
 - [IPTV-org](https://github.com/iptv-org) for the public channel and stream
   metadata.
-
