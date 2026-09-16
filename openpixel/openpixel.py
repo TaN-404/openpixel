@@ -103,6 +103,14 @@ class VideoState(rx.State):
     search_text: str = ""
     current_view: str = "player"
 
+    # State for the "assigned channels" directory (Alt+L), a small,
+    # search-and-arrow-key-navigable list built from `numbered_channels`
+    # rather than the full IPTV catalogue.
+    _assigned_catalog: list[dict[str, str]] = []
+    assigned_streams: list[dict[str, str]] = []
+    assigned_search_text: str = ""
+    assigned_selected_index: int = 0
+
     stream_url: str = ""
     stream_title: str = ""
 
@@ -123,6 +131,7 @@ class VideoState(rx.State):
         global _BASE_CATALOG_CACHE
 
         self.restore_numbered_channels()
+        self._play_smallest_numbered_channel()
 
         if self._channel_catalog:
             self._refresh_visible_channels(reset_page=True)
@@ -254,6 +263,45 @@ class VideoState(rx.State):
         self.search_text = value
         self._refresh_visible_channels(reset_page=True)
 
+    def update_assigned_search(self, value: str):
+        """Filter the assigned-channels directory by number or name."""
+
+        self.assigned_search_text = value
+        self._refresh_assigned_channels(reset_selection=True)
+
+    def _build_assigned_catalog(self) -> list[dict[str, str]]:
+        catalog = [
+            {
+                "number": number,
+                "title": str(channel.get("title", "")),
+                "channel_id": str(channel.get("channel_id", "")),
+                "url": str(channel.get("url", "")),
+            }
+            for number, channel in self.numbered_channels.items()
+            if isinstance(channel, dict) and channel.get("url")
+        ]
+        catalog.sort(key=lambda channel: int(channel["number"]))
+        return catalog
+
+    def _refresh_assigned_channels(self, reset_selection: bool = False):
+        self._assigned_catalog = self._build_assigned_catalog()
+        search = self.assigned_search_text.strip().casefold()
+
+        if search:
+            matches = [
+                channel
+                for channel in self._assigned_catalog
+                if search in channel["number"]
+                or search in channel["title"].casefold()
+            ]
+        else:
+            matches = self._assigned_catalog
+
+        self.assigned_streams = matches
+
+        if reset_selection or self.assigned_selected_index >= len(matches):
+            self.assigned_selected_index = 0
+
     def _refresh_visible_channels(self, reset_page: bool = False):
         search = self.search_text.strip().casefold()
 
@@ -311,6 +359,23 @@ class VideoState(rx.State):
         self.current_view = "menu"
         self.selected_index = 0
 
+    def select_channel(self, index: int):
+        """Highlight a channel by clicking/hovering it in the grid."""
+
+        self.selected_index = index
+
+    def open_assigned_list(self):
+        """Show the small directory of channels that have a number assigned."""
+
+        self.current_view = "assigned"
+        self.assigned_search_text = ""
+        self._refresh_assigned_channels(reset_selection=True)
+
+    def select_assigned_channel(self, index: int):
+        """Highlight a row by clicking/hovering it in the assigned list."""
+
+        self.assigned_selected_index = index
+
     def close_menu(self):
         self.show_number_dialog = False
         self.current_view = "player"
@@ -346,6 +411,58 @@ class VideoState(rx.State):
                     selected_channel["url"],
                     selected_channel["title"],
                 )
+            return
+        else:
+            return
+
+        # Arrow-key navigation moves `selected_index` on the backend, but the
+        # browser has no reason to scroll the grid on its own. Ask the
+        # newly-selected tile to bring itself into view once the DOM has
+        # actually updated with the new selection.
+        yield rx.call_script(
+            """
+            requestAnimationFrame(() => {
+                const selected = document.querySelector(
+                    '[data-channel-selected="true"]'
+                );
+                if (selected) {
+                    selected.scrollIntoView({block: "nearest", behavior: "smooth"});
+                }
+            });
+            """
+        )
+
+    def handle_assigned_key(self, key: str, modifiers: dict[str, bool]):
+        if not self.assigned_streams:
+            return
+
+        if key == "ArrowDown":
+            self.assigned_selected_index = (
+                self.assigned_selected_index + 1
+            ) % len(self.assigned_streams)
+        elif key == "ArrowUp":
+            self.assigned_selected_index = (
+                self.assigned_selected_index - 1
+            ) % len(self.assigned_streams)
+        elif key == "Enter":
+            selected_channel = self.assigned_streams[self.assigned_selected_index]
+            self.play_stream(selected_channel["url"], selected_channel["title"])
+            return
+        else:
+            return
+
+        yield rx.call_script(
+            """
+            requestAnimationFrame(() => {
+                const selected = document.querySelector(
+                    '[data-assigned-selected="true"]'
+                );
+                if (selected) {
+                    selected.scrollIntoView({block: "nearest", behavior: "smooth"});
+                }
+            });
+            """
+        )
 
     def handle_global_key(self, key: str, modifiers: dict[str, bool]):
         """Handle application-wide keyboard input."""
@@ -354,20 +471,30 @@ class VideoState(rx.State):
         alt_pressed = modifiers.get("alt_key", False)
         meta_pressed = modifiers.get("meta_key", False)
 
-        if ctrl_pressed and key.lower() == "m":
+        if alt_pressed and key.lower() == "m":
             self.channel_number_buffer = ""
             self.channel_number_message = ""
             self.number_entry_version += 1
-            if self.current_view == "player":
-                self.open_menu()
-            else:
+            if self.current_view == "menu":
                 self.close_menu()
+            else:
+                self.open_menu()
+            return
+
+        if alt_pressed and key.lower() == "l":
+            self.channel_number_buffer = ""
+            self.channel_number_message = ""
+            self.number_entry_version += 1
+            if self.current_view == "assigned":
+                self.close_menu()
+            else:
+                self.open_assigned_list()
             return
 
         if key == "Escape":
             if self.show_number_dialog:
                 self.close_number_dialog()
-            elif self.current_view == "menu":
+            elif self.current_view in ("menu", "assigned"):
                 self.close_menu()
             else:
                 self.channel_number_buffer = ""
@@ -549,6 +676,34 @@ class VideoState(rx.State):
             self.numbered_channels = {}
             self.numbered_channels_json = "{}"
 
+    def _play_smallest_numbered_channel(self):
+        """Auto-tune to the lowest assigned channel number on app start.
+
+        Only runs when nothing is playing yet, so it acts purely as a
+        startup default and never interrupts a channel the user already
+        chose (e.g. if `load_streams` were ever triggered again later).
+        """
+
+        if self.stream_url or not self.numbered_channels:
+            return
+
+        numbers = [
+            number
+            for number, channel in self.numbered_channels.items()
+            if isinstance(channel, dict) and channel.get("url") and number.isdigit()
+        ]
+        if not numbers:
+            return
+
+        smallest_number = min(numbers, key=int)
+        channel = self.numbered_channels[smallest_number]
+
+        self.stream_url = channel["url"]
+        self.stream_title = str(channel.get("title", ""))
+        self.actual_is_playing = False
+        self.is_playing = True
+        self._ignore_pause_until = time.monotonic() + PLAYER_TRANSITION_GRACE_SECONDS
+
     @rx.event(background=True)
     async def tune_after_delay(self, timer_version: int):
         """Tune three seconds after the most recent number key."""
@@ -565,29 +720,117 @@ def channel_number_overlay() -> rx.Component:
     return rx.cond(
         VideoState.channel_number_buffer != "",
         rx.box(
-            rx.text(VideoState.channel_number_buffer, size="8", weight="bold"),
-            position="fixed",
-            top="30px",
-            right="30px",
-            padding="15px 25px",
-            background_color="rgba(0, 0, 0, 0.80)",
+            rx.vstack(
+                rx.text(
+                    "CHANNEL",
+                    size="2",
+                    weight="bold",
+                    color="rgba(255,255,255,0.7)",
+                ),
+                rx.text(
+                    VideoState.channel_number_buffer,
+                    size="9",
+                    weight="bold",
+                    letter_spacing="6px",
+                ),
+                spacing="0",
+                align_items="end",
+            ),
+            position="absolute",
+            top="40px",
+            right="40px",
+            padding="14px 22px",
+            background_color="rgba(0, 0, 0, 0.78)",
             color="white",
             border_radius="10px",
-            z_index="1000",
+            border="1px solid rgba(255,255,255,0.15)",
+            box_shadow="0 8px 30px rgba(0,0,0,0.45)",
+            z_index="20",
+            pointer_events="none",
         ),
         rx.cond(
             VideoState.channel_number_message != "",
             rx.box(
-                rx.text(VideoState.channel_number_message, weight="bold"),
-                position="fixed",
-                top="30px",
-                right="30px",
-                padding="15px 25px",
-                background_color="var(--red-9)",
+                rx.text(
+                    VideoState.channel_number_message,
+                    weight="bold",
+                ),
+                position="absolute",
+                top="40px",
+                right="40px",
+                padding="14px 22px",
+                background_color="rgba(180, 20, 20, 0.90)",
                 color="white",
                 border_radius="10px",
-                z_index="1000",
+                z_index="20",
+                pointer_events="none",
             ),
+        ),
+    )
+
+def player_top_overlay() -> rx.Component:
+    return rx.hstack(
+        rx.heading(
+            "📺 OpenPixel TV",
+            size="6",
+            color="white",
+            text_shadow="0 2px 8px black",
+        ),
+
+        rx.spacer(),
+
+        rx.button(
+            rx.icon("list-ordered"),
+            "My Channels",
+            rx.text.kbd("Alt"),
+            "+",
+            rx.text.kbd("L"),
+            on_click=VideoState.open_assigned_list,
+            variant="soft",
+            color_scheme="gray",
+        ),
+
+        rx.button(
+            rx.icon("menu"),
+            "Channels",
+            rx.text.kbd("Alt"),
+            "+",
+            rx.text.kbd("M"),
+            on_click=VideoState.open_menu,
+            variant="soft",
+            color_scheme="gray",
+        ),
+
+        rx.button(
+            rx.icon("maximize"),
+            on_click=rx.call_script(
+                """
+                const player = document.getElementById("player-stage");
+                if (player && !document.fullscreenElement) {
+                    player.requestFullscreen();
+                } else if (document.fullscreenElement) {
+                    document.exitFullscreen();
+                }
+                """
+            ),
+            variant="soft",
+            color_scheme="gray",
+            aria_label="Toggle fullscreen",
+        ),
+
+        position="absolute",
+        top="0",
+        left="0",
+        right="0",
+        z_index="15",
+        padding="24px 30px 55px",
+        align_items="center",
+        background=(
+            "linear-gradient("
+            "to bottom, "
+            "rgba(0,0,0,0.85), "
+            "rgba(0,0,0,0)"
+            ")"
         ),
     )
 
@@ -643,139 +886,208 @@ def channel_button(
 ) -> rx.Component:
     is_selected = index == VideoState.selected_index
 
-    return rx.card(
-        rx.hstack(
-            rx.cond(is_selected, rx.icon("chevron-right"), rx.box(width="24px")),
-            rx.vstack(
-                rx.text(stream["title"], weight="bold"),
-                rx.hstack(
-                    rx.hstack(
-                        rx.text(stream["country"], size="1", color_scheme="gray"),
-                        rx.text("•", size="1", color_scheme="gray"),
-                        rx.text(stream["categories"], size="1", color_scheme="gray"),
-                        rx.text("•", size="1", color_scheme="gray"),
-                        rx.text(stream["quality"], size="1", color_scheme="gray"),
-                        spacing="2",
-                        wrap="wrap",
-                    ),
-                    rx.cond(
-                        stream["number"] != "",
-                        rx.badge(
-                            rx.text("Channel ", stream["number"]),
-                            color_scheme="blue",
-                        ),
-                        rx.badge("No number", color_scheme="gray"),
-                    ),
+    return rx.box(
+        rx.vstack(
+            rx.hstack(
+                rx.icon(
+                    "tv",
+                    size=18,
+                    color=rx.cond(is_selected, "var(--accent-11)", "var(--gray-9)"),
+                    flex_shrink="0",
                 ),
-                align_items="start",
-                spacing="1",
+                rx.text(
+                    stream["title"],
+                    weight="bold",
+                    size="3",
+                    overflow="hidden",
+                    text_overflow="ellipsis",
+                    white_space="nowrap",
+                ),
+                spacing="2",
+                align_items="center",
+                width="100%",
+            ),
+            rx.hstack(
+                rx.badge(stream["country"], variant="surface", color_scheme="gray"),
+                rx.badge(stream["quality"], variant="surface", color_scheme="gray"),
+                spacing="2",
+                wrap="wrap",
+            ),
+            rx.text(
+                stream["categories"],
+                size="1",
+                color_scheme="gray",
+                overflow="hidden",
+                text_overflow="ellipsis",
+                white_space="nowrap",
+                width="100%",
             ),
             rx.spacer(),
-            rx.button(
-                rx.icon("hash"),
-                "Assign",
-                on_click=VideoState.open_number_dialog(
-                    stream["channel_id"], stream["title"], stream["url"]
+            rx.cond(
+                stream["number"] != "",
+                rx.badge(
+                    rx.text("Channel ", stream["number"]),
+                    color_scheme="blue",
+                    variant="soft",
                 ),
-                variant="soft",
+                rx.badge("Unassigned", color_scheme="gray", variant="soft"),
             ),
-            rx.button(
-                rx.icon("play"),
-                "Play",
-                on_click=VideoState.play_stream(stream["url"], stream["title"]),
+            rx.hstack(
+                rx.button(
+                    rx.icon("hash", size=15),
+                    "Assign",
+                    on_click=VideoState.open_number_dialog(
+                        stream["channel_id"], stream["title"], stream["url"]
+                    ),
+                    variant="soft",
+                    color_scheme="gray",
+                    size="2",
+                    flex="1",
+                ),
+                rx.button(
+                    rx.icon("play", size=15),
+                    "Play",
+                    on_click=VideoState.play_stream(stream["url"], stream["title"]),
+                    size="2",
+                    flex="1",
+                ),
+                width="100%",
+                spacing="2",
             ),
+            align_items="start",
+            spacing="3",
+            height="100%",
             width="100%",
-            align_items="center",
         ),
-        background_color=rx.cond(is_selected, "var(--accent-5)", "var(--gray-2)"),
+        # Marks the tile the keyboard cursor is currently on, so arrow-key
+        # navigation can find it and scroll it into view (see
+        # handle_menu_key), and so it can be styled as selected.
+        custom_attrs={"data-channel-selected": rx.cond(is_selected, "true", "false")},
+        on_click=VideoState.select_channel(index),
+        background=rx.cond(is_selected, "var(--accent-a5)", "var(--gray-a4)"),
         border=rx.cond(
             is_selected,
             "2px solid var(--accent-9)",
-            "2px solid transparent",
+            "2px solid var(--gray-a6)",
         ),
+        box_shadow=rx.cond(is_selected, "0 0 0 4px var(--accent-a4)", "none"),
+        border_radius="16px",
+        padding="16px",
+        cursor="pointer",
+        transition="transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease",
+        _hover={
+            "border_color": "var(--accent-8)",
+            "transform": "translateY(-3px)",
+            "box_shadow": "0 10px 28px rgba(0,0,0,0.35)",
+        },
         width="100%",
-        padding="10px",
+        height="100%",
     )
 
 
+
 def player_view() -> rx.Component:
-    return rx.center(
-        rx.vstack(
-            channel_number_overlay(),
-            rx.hstack(
-                rx.heading("📺 OpenPixel TV", size="7"),
-                rx.spacer(),
-                rx.button(
-                    rx.icon("menu"),
-                    "Channel Menu",
-                    rx.text.kbd("Ctrl"),
-                    "+",
-                    rx.text.kbd("M"),
-                    on_click=VideoState.open_menu,
-                ),
+    """Fullscreen television/player view."""
+
+    return rx.box(
+        # Video or empty-player background.
+        rx.cond(
+            VideoState.stream_url != "",
+            rx.video(
+                src=VideoState.stream_url,
+                key=VideoState.stream_url,
+                controls=True,
+                playing=VideoState.is_playing,
+                on_play=VideoState.player_started,
+                on_pause=VideoState.player_paused,
+                id="tv-player",
+
+                position="absolute",
+                inset="0",
                 width="100%",
-                align_items="center",
+                height="100%",
+                object_fit="contain",
+                background_color="black",
             ),
-            rx.cond(
-                VideoState.stream_url != "",
+            rx.center(
                 rx.vstack(
-                    rx.video(
-                        url=VideoState.stream_url,
-                        key=VideoState.stream_url,
-                        controls=True,
-                        playing=VideoState.is_playing,
-                        on_play=VideoState.player_started,
-                        on_pause=VideoState.player_paused,
-                        id="tv-player",
-                        width="100%",
-                        height="auto",
-                        aspect_ratio="16 / 9",
+                    rx.icon(
+                        "tv",
+                        size=80,
+                        color="var(--gray-8)",
                     ),
-                    rx.hstack(
-                        rx.text(VideoState.stream_title, weight="bold", size="4"),
-                        rx.spacer(),
-                        rx.text("Space: pause/play", color_scheme="gray", size="2"),
-                        width="100%",
+                    rx.text(
+                        "Press Alt + M to select a channel",
+                        color="white",
+                        size="4",
                     ),
-                    width="100%",
+                    rx.text(
+                        "Press Alt + L to jump to your assigned channels",
+                        color="var(--gray-9)",
+                        size="2",
+                    ),
                     align_items="center",
-                    spacing="3",
+                    spacing="4",
                 ),
-                rx.center(
-                    rx.vstack(
-                        rx.icon("tv", size=60, color="var(--gray-8)"),
-                        rx.text(
-                            "Open the menu and select a channel.",
-                            color_scheme="gray",
-                        ),
-                        align_items="center",
-                        spacing="3",
-                    ),
-                    width="100%",
-                    aspect_ratio="16 / 9",
-                    background_color="var(--gray-3)",
-                    border_radius="10px",
+                position="absolute",
+                inset="0",
+                background_color="black",
+            ),
+        ),
+
+        # Everything below is drawn over the video.
+        player_top_overlay(),
+        channel_number_overlay(),
+
+        # Channel title above the native video controls.
+        rx.cond(
+            VideoState.stream_title != "",
+            rx.box(
+                rx.text(
+                    VideoState.stream_title,
+                    size="5",
+                    weight="bold",
+                    color="white",
+                    text_shadow="0 2px 8px black",
+                ),
+                position="absolute",
+                left="0",
+                right="0",
+                bottom="0",
+                z_index="10",
+                padding="70px 30px 70px",
+                pointer_events="none",
+                background=(
+                    "linear-gradient("
+                    "to top, "
+                    "rgba(0,0,0,0.80), "
+                    "rgba(0,0,0,0)"
+                    ")"
                 ),
             ),
-            width="100%",
-            max_width="1000px",
-            spacing="4",
         ),
+
+        id="player-stage",
+
+        # This makes the player occupy the complete browser viewport.
+        position="relative",
         width="100vw",
-        min_height="100vh",
-        padding="20px",
-        background_color="var(--gray-2)",
+        height="100dvh",
+        overflow="hidden",
+        background_color="black",
     )
 
 
 def pagination_controls() -> rx.Component:
     return rx.hstack(
         rx.button(
-            rx.icon("chevron-left"),
+            rx.icon("chevron-left", size=16),
             "Previous",
             on_click=VideoState.previous_page,
             disabled=~VideoState.has_previous_page,
             variant="soft",
+            color_scheme="gray",
+            size="2",
         ),
         rx.spacer(),
         rx.text(
@@ -786,15 +1098,18 @@ def pagination_controls() -> rx.Component:
             " • ",
             VideoState.total_results,
             " channels",
+            size="2",
             color_scheme="gray",
         ),
         rx.spacer(),
         rx.button(
             "Next",
-            rx.icon("chevron-right"),
+            rx.icon("chevron-right", size=16),
             on_click=VideoState.next_page,
             disabled=~VideoState.has_next_page,
             variant="soft",
+            color_scheme="gray",
+            size="2",
         ),
         width="100%",
         align_items="center",
@@ -802,30 +1117,55 @@ def pagination_controls() -> rx.Component:
 
 
 def menu_view() -> rx.Component:
-    return rx.container(
-        rx.vstack(
-            rx.hstack(
-                rx.heading("Channels", size="7"),
-                rx.spacer(),
-                rx.button(
-                    rx.icon("arrow-left"),
-                    "Back to TV",
-                    rx.text.kbd("Esc"),
-                    on_click=VideoState.close_menu,
-                    variant="soft",
+    return rx.box(
+        # Header and search stay put; only the channel grid below scrolls.
+        # Keeping the app inside its own flex/overflow container (instead of
+        # relying on page-level scroll) is also what makes the arrow-key
+        # scrollIntoView behaviour in handle_menu_key reliable.
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.heading("📺 Channels", size="7"),
+                    rx.spacer(),
+                    rx.button(
+                        rx.icon("arrow-left"),
+                        "Back to TV",
+                        rx.text.kbd("Esc"),
+                        on_click=VideoState.close_menu,
+                        variant="soft",
+                        color_scheme="gray",
+                    ),
+                    width="100%",
+                    align_items="center",
+                ),
+                rx.input(
+                    placeholder="Search name, country, category, quality, ID or number...",
+                    value=VideoState.search_text,
+                    on_change=VideoState.update_search,
+                    on_key_down=VideoState.handle_menu_key,
+                    auto_focus=True,
+                    width="100%",
+                    size="3",
+                    radius="large",
+                ),
+                rx.cond(
+                    VideoState.error_message != "",
+                    rx.callout(
+                        VideoState.error_message,
+                        icon="triangle-alert",
+                        color_scheme="red",
+                        width="100%",
+                    ),
                 ),
                 width="100%",
-                align_items="center",
+                spacing="4",
             ),
-            rx.input(
-                placeholder="Search name, country, category, quality, ID or number...",
-                value=VideoState.search_text,
-                on_change=VideoState.update_search,
-                on_key_down=VideoState.handle_menu_key,
-                auto_focus=True,
-                width="100%",
-                size="3",
-            ),
+            width="100%",
+            max_width="1400px",
+            margin="0 auto",
+            padding="28px 32px 20px",
+        ),
+        rx.box(
             rx.cond(
                 VideoState.is_loading,
                 rx.center(
@@ -836,43 +1176,239 @@ def menu_view() -> rx.Component:
                         spacing="3",
                     ),
                     width="100%",
-                    padding="40px",
+                    padding="60px",
                 ),
                 rx.cond(
                     VideoState.streams.length() > 0,
                     rx.vstack(
-                        pagination_controls(),
-                        rx.foreach(VideoState.streams, channel_button),
-                        pagination_controls(),
+                        rx.box(
+                            pagination_controls(),
+                            width="100%",
+                            max_width="1400px",
+                            margin="0 auto",
+                        ),
+                        rx.grid(
+                            rx.foreach(VideoState.streams, channel_button),
+                            columns={"initial": "1", "sm": "2", "lg": "3"},
+                            spacing="4",
+                            width="100%",
+                            max_width="1400px",
+                            margin="0 auto",
+                        ),
+                        rx.box(
+                            pagination_controls(),
+                            width="100%",
+                            max_width="1400px",
+                            margin="0 auto",
+                        ),
                         width="100%",
-                        spacing="2",
+                        spacing="4",
+                        align_items="center",
                     ),
                     rx.center(
                         rx.text("No matching channels found.", color_scheme="gray"),
                         width="100%",
-                        padding="40px",
+                        padding="60px",
                     ),
                 ),
             ),
-            rx.cond(
-                VideoState.error_message != "",
-                rx.callout(
-                    VideoState.error_message,
-                    icon="triangle-alert",
-                    color_scheme="red",
+            id="channel-scroll-area",
+            width="100%",
+            flex="1 1 auto",
+            overflow_y="auto",
+            padding="4px 32px 40px",
+        ),
+        # Fixed + translucent + blurred so it reads as a channel-guide
+        # overlay (Tata Sky / DTH style) sitting on top of the still-playing
+        # video, rather than a separate opaque page.
+        position="fixed",
+        inset="0",
+        z_index="30",
+        display="flex",
+        flex_direction="column",
+        background="rgba(6, 9, 16, 0.80)",
+        backdrop_filter="blur(22px) saturate(140%)",
+    )
+
+
+def assigned_channel_row(
+    channel: rx.Var[dict[str, str]],
+    index: rx.Var[int],
+) -> rx.Component:
+    is_selected = index == VideoState.assigned_selected_index
+
+    return rx.box(
+        rx.hstack(
+            rx.box(
+                rx.text(
+                    channel["number"],
+                    size="6",
+                    weight="bold",
+                    color=rx.cond(
+                        is_selected, "var(--accent-11)", "var(--gray-11)"
+                    ),
+                ),
+                min_width="56px",
+                text_align="center",
+            ),
+            rx.box(width="1px", height="32px", background="var(--gray-a6)"),
+            rx.vstack(
+                rx.text(
+                    channel["title"],
+                    weight="bold",
+                    size="3",
+                    overflow="hidden",
+                    text_overflow="ellipsis",
+                    white_space="nowrap",
                     width="100%",
                 ),
+                rx.text(
+                    channel["channel_id"],
+                    size="1",
+                    color_scheme="gray",
+                ),
+                align_items="start",
+                spacing="0",
+                min_width="0",
+                flex="1",
+            ),
+            rx.spacer(),
+            rx.button(
+                rx.icon("play", size=15),
+                "Play",
+                on_click=VideoState.play_stream(channel["url"], channel["title"]),
+                size="2",
+                flex_shrink="0",
             ),
             width="100%",
+            align_items="center",
             spacing="4",
-            padding_y="30px",
         ),
-        max_width="1000px",
+        # Marks the row the keyboard cursor is on, so arrow-key navigation
+        # (handle_assigned_key) can scroll it into view.
+        custom_attrs={"data-assigned-selected": rx.cond(is_selected, "true", "false")},
+        on_click=VideoState.select_assigned_channel(index),
+        background=rx.cond(is_selected, "var(--accent-a5)", "var(--gray-a4)"),
+        border=rx.cond(
+            is_selected,
+            "2px solid var(--accent-9)",
+            "2px solid var(--gray-a6)",
+        ),
+        border_radius="14px",
+        padding="12px 18px",
+        cursor="pointer",
+        transition="border-color 0.15s ease, background 0.15s ease",
+        _hover={"border_color": "var(--accent-8)"},
+        width="100%",
+    )
+
+
+def assigned_view() -> rx.Component:
+    """A small directory of only the channels the user has numbered."""
+
+    return rx.box(
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.heading("🔢 My Channels", size="7"),
+                    rx.spacer(),
+                    rx.button(
+                        rx.icon("arrow-left"),
+                        "Back to TV",
+                        rx.text.kbd("Esc"),
+                        on_click=VideoState.close_menu,
+                        variant="soft",
+                        color_scheme="gray",
+                    ),
+                    width="100%",
+                    align_items="center",
+                ),
+                rx.input(
+                    placeholder="Search by number or name...",
+                    value=VideoState.assigned_search_text,
+                    on_change=VideoState.update_assigned_search,
+                    on_key_down=VideoState.handle_assigned_key,
+                    auto_focus=True,
+                    width="100%",
+                    size="3",
+                    radius="large",
+                ),
+                width="100%",
+                spacing="4",
+            ),
+            width="100%",
+            max_width="900px",
+            margin="0 auto",
+            padding="28px 32px 20px",
+        ),
+        rx.box(
+            rx.cond(
+                VideoState.assigned_streams.length() > 0,
+                rx.vstack(
+                    rx.foreach(VideoState.assigned_streams, assigned_channel_row),
+                    width="100%",
+                    max_width="900px",
+                    margin="0 auto",
+                    spacing="3",
+                    padding_bottom="40px",
+                ),
+                rx.center(
+                    rx.vstack(
+                        rx.icon("list", size=48, color="var(--gray-8)"),
+                        rx.text(
+                            rx.cond(
+                                VideoState.assigned_search_text != "",
+                                "No assigned channels match your search.",
+                                "No channels assigned yet. Open the channel "
+                                "menu (Alt+M) and use Assign to give a "
+                                "channel a number.",
+                            ),
+                            color_scheme="gray",
+                            text_align="center",
+                        ),
+                        align_items="center",
+                        spacing="3",
+                    ),
+                    width="100%",
+                    padding="60px",
+                ),
+            ),
+            id="assigned-scroll-area",
+            width="100%",
+            flex="1 1 auto",
+            overflow_y="auto",
+            padding="4px 32px 40px",
+        ),
+        position="fixed",
+        inset="0",
+        z_index="30",
+        display="flex",
+        flex_direction="column",
+        background="rgba(6, 9, 16, 0.80)",
+        backdrop_filter="blur(22px) saturate(140%)",
     )
 
 
 def index() -> rx.Component:
     return rx.fragment(
+        # The native <video controls> element has its own built-in keyboard
+        # shortcuts (Space toggles play/pause, arrows seek, etc.). Once a
+        # click gives it focus, pressing Space would trigger that native
+        # toggle *and* the app's own handle_playback_key below, flipping
+        # playback twice in a row. Immediately blurring the video whenever it
+        # gains focus keeps this app's state as the single source of truth
+        # without disabling the native control bar itself (clicks on the
+        # play/seek/volume controls still work — only keyboard focus is
+        # removed).
+        rx.script(
+            """
+            document.addEventListener("focusin", (event) => {
+                if (event.target && event.target.tagName === "VIDEO") {
+                    event.target.blur();
+                }
+            });
+            """
+        ),
         rx.window_event_listener(
             on_key_down=VideoState.handle_global_key,
         ),
@@ -882,16 +1418,32 @@ def index() -> rx.Component:
             # delaying number-key entry handled by the listener above.
             on_key_down=VideoState.handle_playback_key.debounce(200),
         ),
+        # player_view is now always mounted (instead of being swapped out by
+        # a top-level rx.cond) so the <video> element never unmounts. The
+        # channel menu and assigned-channels list are drawn as translucent
+        # overlays on top of it, so the current channel keeps playing behind
+        # the guide instead of stopping while you browse.
+        player_view(),
         rx.cond(
-            VideoState.current_view == "player",
-            player_view(),
+            VideoState.current_view == "menu",
             menu_view(),
+        ),
+        rx.cond(
+            VideoState.current_view == "assigned",
+            assigned_view(),
         ),
         channel_number_dialog(),
     )
 
 
-app = rx.App()
+app = rx.App(
+    theme=rx.theme(
+        appearance="dark",
+        accent_color="blue",
+        gray_color="slate",
+        radius="large",
+    ),
+)
 app.add_page(
     index,
     route="/",
