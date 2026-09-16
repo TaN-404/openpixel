@@ -74,9 +74,10 @@ class VideoState(rx.State):
     _channel_catalog: list[dict[str, str]] = []
     _filtered_catalog: list[dict[str, str]] = []
 
-    # This guard prevents stale media events from making playback rapidly
-    # alternate between pause and play while a stream is being replaced.
+    # These guards prevent stale media events and repeated keydown events from
+    # making playback rapidly alternate between pause and play.
     _ignore_pause_until: float = 0.0
+    _space_key_held: bool = False
 
     channel_number_buffer: str = ""
     channel_number_message: str = ""
@@ -378,6 +379,15 @@ class VideoState(rx.State):
         if self.current_view != "player":
             return
 
+        if key in (" ", "Space", "Spacebar"):
+            # Browsers repeatedly fire keydown while a key is held.  Wait for
+            # keyup before accepting another Space press.
+            if self._space_key_held:
+                return
+            self._space_key_held = True
+            self.toggle_playback()
+            return
+
         has_modifier = ctrl_pressed or alt_pressed or meta_pressed
 
         if key.isdigit() and not has_modifier:
@@ -407,17 +417,9 @@ class VideoState(rx.State):
             self.number_entry_version += 1
             self._tune_to_channel_number()
 
-    def handle_playback_key(self, key: str, modifiers: dict[str, bool]):
-        """Handle Space separately so repeated keydown events can be debounced."""
-
-        has_modifier = (
-            modifiers.get("ctrl_key", False)
-            or modifiers.get("alt_key", False)
-            or modifiers.get("meta_key", False)
-        )
-
-        if key in (" ", "Space", "Spacebar") and not has_modifier:
-            self.toggle_playback()
+    def handle_global_key_up(self, key: str, _modifiers: dict[str, bool]):
+        if key in (" ", "Space", "Spacebar"):
+            self._space_key_held = False
 
     def toggle_playback(self):
         if self.current_view == "player" and self.stream_url:
@@ -875,12 +877,7 @@ def index() -> rx.Component:
     return rx.fragment(
         rx.window_event_listener(
             on_key_down=VideoState.handle_global_key,
-        ),
-        rx.window_event_listener(
-            # A held key produces many keydown events. Debouncing this separate
-            # listener turns that burst into one playback toggle without
-            # delaying number-key entry handled by the listener above.
-            on_key_down=VideoState.handle_playback_key.debounce(200),
+            on_key_up=VideoState.handle_global_key_up,
         ),
         rx.cond(
             VideoState.current_view == "player",
